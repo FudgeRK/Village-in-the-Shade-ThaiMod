@@ -169,7 +169,7 @@ static int parse_ida_pattern(const char* pattern, uint8_t* out_bytes, uint8_t* o
     return len;
 }
 
-/* Scan PE .text section for IDA pattern */
+/* Scan PE .text section and accept only a unique IDA-pattern match. */
 static uintptr_t scan_pattern_ida(uintptr_t base, size_t text_va, size_t text_size, const char* pattern)
 {
     uint8_t pat_bytes[256];
@@ -180,16 +180,20 @@ static uintptr_t scan_pattern_ida(uintptr_t base, size_t text_va, size_t text_si
     const uint8_t* blob = (const uint8_t*)(base + text_va);
     size_t limit = text_size - pat_len;
 
+    uintptr_t result = 0;
+    int matches = 0;
     for (size_t i = 0; i <= limit; i++) {
         size_t j = 0;
         for (; j < (size_t)pat_len; j++) {
             if (pat_mask[j] && blob[i + j] != pat_bytes[j]) break;
         }
         if (j == (size_t)pat_len) {
-            return base + text_va + i;
+            result = base + text_va + i;
+            matches++;
+            if (matches > 1) return 0;
         }
     }
-    return 0;
+    return matches == 1 ? result : 0;
 }
 
 /* Apply a single memory patch safely */
@@ -331,9 +335,14 @@ void cheats_init(const wchar_t* game_dir_w, const wchar_t* mod_dir_w, void (*log
     for (int i = 0; i < NUM_PATCHES; i++) {
         uintptr_t match = scan_pattern_ida(base, text_va, text_size, g_patches[i].pattern);
         if (match) {
-            g_patches[i].addr = match + g_patches[i].offset;
-            memcpy(g_patches[i].orig_bytes, (void*)g_patches[i].addr, g_patches[i].size);
-            resolved++;
+            uintptr_t candidate = match + g_patches[i].offset;
+            if (memcmp((const void*)candidate, g_patches[i].orig_bytes, g_patches[i].size) == 0) {
+                g_patches[i].addr = candidate;
+                resolved++;
+            } else {
+                cheat_log("[Cheats] Warning: Original-byte validation failed for '%s'; patch disabled.",
+                          g_patches[i].name);
+            }
         } else {
             cheat_log("[Cheats] Warning: Pattern scan missed for '%s'", g_patches[i].name);
         }
@@ -348,14 +357,8 @@ void cheats_init(const wchar_t* game_dir_w, const wchar_t* mod_dir_w, void (*log
         cheat_log("[Cheats] Resolved global pointer dynamically at 0x%p (RVA: 0x%X)", 
                   (void*)g_global_ptr_addr, (uint32_t)(g_global_ptr_addr - base));
     } else {
-        /* Fallback to known static RVA: v1.20 = 0x10FCBB0, v1.10 = 0x10DFAD0 */
-        if (is_readable((const void*)(base + 0x10FCBB0), sizeof(uintptr_t)) && *(uintptr_t*)(base + 0x10FCBB0) != 0) {
-            g_global_ptr_addr = base + 0x10FCBB0;
-        } else {
-            g_global_ptr_addr = base + 0x10DFAD0;
-        }
-        cheat_log("[Cheats] Using fallback global pointer at 0x%p (RVA: 0x%X)", 
-                  (void*)g_global_ptr_addr, (uint32_t)(g_global_ptr_addr - base));
+        g_global_ptr_addr = 0;
+        cheat_log("[Cheats] Global state signature not found uniquely; cheats disabled for this game build.");
     }
 
     cheat_log("[Cheats] Memory signatures resolved: %d/%d available.", resolved, NUM_PATCHES);

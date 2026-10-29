@@ -1,0 +1,15 @@
+{
+  "final_unique_translations": 762,
+  "source_counts": {
+    "review": 394,
+    "adjudication": 98,
+    "verified_manual_override": 3,
+    "verified_glossary_fix": 3,
+    "first_pass": 264
+  },
+  "exact_manual_overrides": 3,
+  "glossary_replacements": 3,
+  "placeholder_mismatches": 0,
+  "japanese_remaining": 0,
+  "pua_roundtrip_failures": 0
+}

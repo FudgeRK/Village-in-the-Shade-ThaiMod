@@ -1,10 +1,14 @@
-/* Auto-generated verified keyboard memory patch for Village in the Shade v1.20 */
+/* Version-adaptive virtual keyboard memory patch for Village in the Shade.
+ * The stored RVAs document the verified v1.20 layout only. Runtime patching
+ * resolves every original glyph inside one validated keyboard-data window, so
+ * a linker/layout change cannot make the mod write to an old hard-coded RVA.
+ */
 #pragma once
 #include <stdint.h>
 #include <windows.h>
 
 typedef struct {
-    uint32_t rva;
+    uint32_t v120_rva;
     const char* thai;
     const char* orig;
     const char* desc;
@@ -196,83 +200,198 @@ static const VirtualKeyPatchEntry g_virtual_key_patches[] = {
 };
 #define NUM_VIRTUAL_KEY_PATCHES (sizeof(g_virtual_key_patches) / sizeof(g_virtual_key_patches[0]))
 
-/* Unique anchor pattern: 'あ\0' + 'い\0' + 'う\0' (UTF-8 4 bytes each = 12 bytes total) */
-static const uint8_t g_kb_anchor_pattern[12] = {
-    0xE3, 0x81, 0x82, 0x00,
-    0xE3, 0x81, 0x84, 0x00,
-    0xE3, 0x81, 0x86, 0x00
-};
-#define STEAM_V120_ANCHOR_RVA 0x00E539BC
+#define KEYBOARD_SEARCH_RADIUS 0x800
+
+static int keyboard_slot_equals(uintptr_t address, const char* text)
+{
+    size_t len = strlen(text);
+    const uint8_t* slot = (const uint8_t*)address;
+    return len == 3 && slot[3] == 0 && memcmp(slot, text, 3) == 0;
+}
+
+static int keyboard_is_first_orig(size_t index)
+{
+    for (size_t i = 0; i < index; i++) {
+        if (strcmp(g_virtual_key_patches[i].orig, g_virtual_key_patches[index].orig) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t keyboard_unique_orig_count(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
+        if (keyboard_is_first_orig(i)) count++;
+    }
+    return count;
+}
+
+static size_t keyboard_find_slot_count(uintptr_t start, uintptr_t end,
+                                       const char* orig, uintptr_t* first)
+{
+    size_t count = 0;
+    uintptr_t p = (start + 3) & ~(uintptr_t)3;
+    if (first) *first = 0;
+
+    for (; p + 4 <= end; p += 4) {
+        if (keyboard_slot_equals(p, orig)) {
+            if (count == 0 && first) *first = p;
+            count++;
+        }
+    }
+    return count;
+}
+
+static size_t keyboard_score_window(uintptr_t start, uintptr_t end)
+{
+    size_t score = 0;
+    for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
+        if (!keyboard_is_first_orig(i)) continue;
+        if (keyboard_find_slot_count(start, end, g_virtual_key_patches[i].orig, NULL) == 1) {
+            score++;
+        }
+    }
+    return score;
+}
+
+static int keyboard_locate_window(uintptr_t base, uintptr_t* out_start,
+                                  uintptr_t* out_end, void (*log_fn)(const char*, ...))
+{
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+    size_t expected = keyboard_unique_orig_count();
+    size_t best_score = 0;
+    int best_ties = 0;
+    uintptr_t best_start = 0;
+    uintptr_t best_end = 0;
+
+    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; s++) {
+        if (memcmp(sh[s].Name, ".rdata", 6) != 0) continue;
+
+        uintptr_t sec_start = base + sh[s].VirtualAddress;
+        size_t sec_size = sh[s].Misc.VirtualSize ? sh[s].Misc.VirtualSize : sh[s].SizeOfRawData;
+        uintptr_t sec_end = sec_start + sec_size;
+        uintptr_t p = (sec_start + 3) & ~(uintptr_t)3;
+
+        /* "あ" is only a probe. Every mapped source glyph must still resolve
+         * exactly once inside the selected window before any memory is changed.
+         */
+        for (; p + 4 <= sec_end; p += 4) {
+            if (!keyboard_slot_equals(p, g_virtual_key_patches[0].orig)) continue;
+
+            uintptr_t window_start = (p > sec_start + KEYBOARD_SEARCH_RADIUS)
+                ? p - KEYBOARD_SEARCH_RADIUS : sec_start;
+            uintptr_t window_end = (p + KEYBOARD_SEARCH_RADIUS < sec_end)
+                ? p + KEYBOARD_SEARCH_RADIUS : sec_end;
+            size_t score = keyboard_score_window(window_start, window_end);
+
+            if (score > best_score) {
+                best_score = score;
+                best_ties = 1;
+                best_start = window_start;
+                best_end = window_end;
+            } else if (score == best_score) {
+                best_ties++;
+            }
+        }
+        break;
+    }
+
+    if (best_score != expected || best_ties != 1) {
+        if (log_fn) {
+            log_fn("[KEYBOARD SCAN] Safe layout resolution failed (%d/%d glyphs, candidates=%d); keyboard patch skipped.",
+                   (int)best_score, (int)expected, best_ties);
+        }
+        return 0;
+    }
+
+    *out_start = best_start;
+    *out_end = best_end;
+    if (log_fn) {
+        log_fn("[KEYBOARD SCAN] Validated version-adaptive keyboard window (RVA 0x%X-0x%X, %d glyphs).",
+               (unsigned int)(best_start - base), (unsigned int)(best_end - base), (int)expected);
+    }
+    return 1;
+}
 
 static void patch_virtual_keyboard_in_memory(uintptr_t base, void (*log_fn)(const char*, ...))
 {
-    uintptr_t anchor_addr = 0;
+    uintptr_t window_start = 0;
+    uintptr_t window_end = 0;
+    uintptr_t resolved[NUM_VIRTUAL_KEY_PATCHES];
+    uintptr_t patch_start = UINTPTR_MAX;
+    uintptr_t patch_end = 0;
 
-    /* 1. Try dynamic pattern scanning in .rdata section */
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
-        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-        if (nt->Signature == IMAGE_NT_SIGNATURE) {
-            IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
-            WORD num_sec = nt->FileHeader.NumberOfSections;
-            for (WORD s = 0; s < num_sec; s++) {
-                if (memcmp(sh[s].Name, ".rdata", 6) == 0) {
-                    uintptr_t sec_va = base + sh[s].VirtualAddress;
-                    size_t sec_sz = sh[s].Misc.VirtualSize ? sh[s].Misc.VirtualSize : sh[s].SizeOfRawData;
-                    if (sec_sz >= sizeof(g_kb_anchor_pattern)) {
-                        const uint8_t* p = (const uint8_t*)sec_va;
-                        size_t limit = sec_sz - sizeof(g_kb_anchor_pattern);
-                        for (size_t i = 0; i <= limit; i++) {
-                            if (p[i] == 0xE3 && memcmp(p + i, g_kb_anchor_pattern, sizeof(g_kb_anchor_pattern)) == 0) {
-                                anchor_addr = sec_va + i;
-                                if (log_fn) {
-                                    log_fn("[KEYBOARD SCAN] Found keyboard table anchor via dynamic scan at 0x%p (RVA=0x%X)!",
-                                           (void*)anchor_addr, (unsigned int)(anchor_addr - base));
-                                }
-                                break;
-                            }
-                        }
-                    }
+    if (!keyboard_locate_window(base, &window_start, &window_end, log_fn)) return;
+
+    /* Resolve and validate the complete patch set before making .rdata writable. */
+    for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
+        uintptr_t address = 0;
+        size_t matches = keyboard_find_slot_count(window_start, window_end,
+                                                  g_virtual_key_patches[i].orig, &address);
+        if (matches != 1 || strlen(g_virtual_key_patches[i].thai) > 3) {
+            if (log_fn) {
+                log_fn("[KEYBOARD PATCH] Validation failed for %s (matches=%d); no keyboard memory changed.",
+                       g_virtual_key_patches[i].desc, (int)matches);
+            }
+            return;
+        }
+
+        resolved[i] = address;
+        if (address < patch_start) patch_start = address;
+        if (address + 4 > patch_end) patch_end = address + 4;
+    }
+
+    for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
+        for (size_t j = 0; j < i; j++) {
+            if (resolved[i] == resolved[j] &&
+                strcmp(g_virtual_key_patches[i].thai, g_virtual_key_patches[j].thai) != 0) {
+                if (log_fn) {
+                    log_fn("[KEYBOARD PATCH] Conflicting replacement for %s; no keyboard memory changed.",
+                           g_virtual_key_patches[i].orig);
+                }
+                return;
+            }
+        }
+    }
+
+    size_t patch_len = (size_t)(patch_end - patch_start);
+    DWORD old_protect;
+
+    if (VirtualProtect((LPVOID)patch_start, patch_len, PAGE_READWRITE, &old_protect)) {
+        int count = 0;
+        for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
+            int already_written = 0;
+            for (size_t j = 0; j < i; j++) {
+                if (resolved[i] == resolved[j]) {
+                    already_written = 1;
                     break;
                 }
             }
-        }
-    }
+            if (already_written) continue;
 
-    /* 2. Fallback to Steam v1.20 hardcoded RVA if pattern scan fails */
-    if (anchor_addr == 0) {
-        anchor_addr = base + STEAM_V120_ANCHOR_RVA;
-        if (log_fn) {
-            log_fn("[KEYBOARD SCAN] Dynamic scan missed, using default v1.20 fallback anchor at 0x%p", (void*)anchor_addr);
-        }
-    }
-
-    /* 3. Unprotect the keyboard string table region and patch */
-    uintptr_t table_start = (anchor_addr > 0x200) ? (anchor_addr - 0x200) : anchor_addr;
-    size_t table_len = 0x1000;
-    DWORD old_protect;
-
-    if (VirtualProtect((LPVOID)table_start, table_len, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        int count = 0;
-        for (size_t i = 0; i < NUM_VIRTUAL_KEY_PATCHES; i++) {
-            int32_t rel = (int32_t)(g_virtual_key_patches[i].rva - STEAM_V120_ANCHOR_RVA);
-            char* dest = (char*)(anchor_addr + rel);
+            char* dest = (char*)resolved[i];
             const char* src = g_virtual_key_patches[i].thai;
             size_t src_len = strlen(src);
-            if (src_len <= 3) {
-                memset(dest, 0, 4);
-                memcpy(dest, src, src_len);
-                count++;
-            }
+            memset(dest, 0, 4);
+            memcpy(dest, src, src_len);
+            count++;
         }
-        VirtualProtect((LPVOID)table_start, table_len, old_protect, &old_protect);
+        VirtualProtect((LPVOID)patch_start, patch_len, old_protect, &old_protect);
         if (log_fn) {
-            log_fn("[KEYBOARD PATCH] Successfully patched %d virtual keyboard keys to Thai in memory (Anchor=0x%p)!",
-                   count, (void*)anchor_addr);
+            log_fn("[KEYBOARD PATCH] Safely patched %d unique virtual keyboard glyphs to Thai.", count);
         }
     } else {
         if (log_fn) {
-            log_fn("[KEYBOARD PATCH] ERROR: Failed to VirtualProtect keyboard memory at 0x%p!", (void*)table_start);
+            log_fn("[KEYBOARD PATCH] ERROR: Failed to make validated keyboard memory writable at 0x%p.",
+                   (void*)patch_start);
         }
     }
 }

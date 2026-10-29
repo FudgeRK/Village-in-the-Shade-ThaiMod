@@ -5,7 +5,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <intrin.h>
-#ifndef _ReturnAddress
+#if defined(_MSC_VER)
+#pragma intrinsic(_ReturnAddress)
+#elif !defined(_ReturnAddress)
 #define _ReturnAddress() __builtin_return_address(0)
 #endif
 #include "minhook-master/include/MinHook.h"
@@ -1504,9 +1506,34 @@ typedef struct {
 typedef struct {
     uint64_t offset;
     uint64_t size;
+    uint64_t original_size;
     char name[128];
     int archive_id; /* 1 = data.dat, 2 = misc_1_00.dat */
+    volatile LONG database_compat; /* 0 = unchecked, 2 = checking, 1 = compatible, -1 = incompatible */
 } VfsEntry;
+
+/* The compatibility check runs from inside the ReadFile hook. Use the
+   MinHook trampolines so checking data.dat never re-enters our own file
+   hooks. The pointers are populated before the first hooked read occurs. */
+typedef HANDLE (WINAPI *t_CreateFileW)(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+static t_CreateFileW fp_original_CreateFileW = NULL;
+
+typedef BOOL (WINAPI *t_ReadFile)(
+    HANDLE hFile,
+    LPVOID lpBuffer,
+    DWORD nNumberOfBytesToRead,
+    LPDWORD lpNumberOfBytesRead,
+    LPOVERLAPPED lpOverlapped
+);
+static t_ReadFile fp_original_ReadFile = NULL;
 
 #define MAX_VFS_ENTRIES 16384
 static VfsEntry g_vfs[MAX_VFS_ENTRIES];
@@ -1522,6 +1549,7 @@ static uint64_t g_fsize_dat = 0;
 static uint64_t g_fsize_misc = 0;
 static uint64_t g_fsize_tex = 0;
 static uint64_t g_fsize_fairy = 0;
+static wchar_t g_data_dat_path_w[MAX_PATH] = L"";
 
 static int load_archive_toc_w(const wchar_t* path_w, int archive_id)
 {
@@ -1550,6 +1578,8 @@ static int load_archive_toc_w(const wchar_t* path_w, int archive_id)
         g_fsize_dat = fsz;
         g_toc_off_dat = hdr.toc_off;
         g_count_dat = hdr.count;
+        wcsncpy(g_data_dat_path_w, path_w, MAX_PATH - 1);
+        g_data_dat_path_w[MAX_PATH - 1] = L'\0';
     } else if (archive_id == 2) {
         g_fsize_misc = fsz;
         g_toc_off_misc = hdr.toc_off;
@@ -1583,7 +1613,9 @@ static int load_archive_toc_w(const wchar_t* path_w, int archive_id)
             VfsEntry* v = &g_vfs[g_vfs_count++];
             v->offset = tocs[i].offset;
             v->size = tocs[i].size;
+            v->original_size = tocs[i].size;
             v->archive_id = archive_id;
+            v->database_compat = 0;
             strncpy(v->name, str_table + n_off, sizeof(v->name) - 1);
             v->name[sizeof(v->name) - 1] = '\0';
             loaded++;
@@ -1615,6 +1647,191 @@ static const char* get_basename(const char* path)
     const char* slash = strrchr(path, '/');
     if (!slash) slash = strrchr(path, '\\');
     return slash ? (slash + 1) : path;
+}
+
+/*
+ * Database files are serialized as a single version-specific blob. Replacing
+ * a newer blob with v1.20 records can corrupt the parser or silently roll back
+ * gameplay data. The verified v1.20 executable keeps its legacy behavior;
+ * newer/unknown builds accept an override only after its complete record shape
+ * matches the database in the currently installed archive. Other resource
+ * types keep the existing resize support.
+ */
+static BOOL is_version_sensitive_database(const char* vfs_name)
+{
+    if (!vfs_name) return FALSE;
+
+    for (const char* p = vfs_name; *p; ++p) {
+        if (_strnicmp(p, "data/database/", 14) == 0 ||
+            _strnicmp(p, "data\\database\\", 14) == 0) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOL is_verified_v120_executable(void)
+{
+    static volatile LONG cached = -1;
+    LONG result = InterlockedCompareExchange(&cached, -1, -1);
+    if (result >= 0) return result != 0;
+
+    static const uint8_t v120_keyboard_anchor[12] = {
+        0xE3, 0x81, 0x82, 0x00, /* あ */
+        0xE3, 0x81, 0x84, 0x00, /* い */
+        0xE3, 0x81, 0x86, 0x00  /* う */
+    };
+    const uintptr_t anchor_rva = 0x00E539BC;
+    BOOL verified = FALSE;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+
+    if (base) {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                anchor_rva + sizeof(v120_keyboard_anchor) <= nt->OptionalHeader.SizeOfImage) {
+                verified = memcmp((const void*)(base + anchor_rva),
+                                  v120_keyboard_anchor, sizeof(v120_keyboard_anchor)) == 0;
+            }
+        }
+    }
+
+    InterlockedExchange(&cached, verified ? 1 : 0);
+    return verified;
+}
+
+static BOOL database_override_matches_current_shape(
+    const VfsEntry* entry,
+    const wchar_t* override_path_w,
+    long ext_size)
+{
+    if (!entry || !override_path_w || ext_size < 12 || !g_data_dat_path_w[0] ||
+        !fp_original_CreateFileW || !fp_original_ReadFile) return FALSE;
+
+    HANDLE original = fp_original_CreateFileW(
+        g_data_dat_path_w, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE replacement = fp_original_CreateFileW(
+        override_path_w, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (original == INVALID_HANDLE_VALUE || replacement == INVALID_HANDLE_VALUE) {
+        if (original != INVALID_HANDLE_VALUE) CloseHandle(original);
+        if (replacement != INVALID_HANDLE_VALUE) CloseHandle(replacement);
+        return FALSE;
+    }
+
+    uint32_t original_header[3] = {0};
+    uint32_t replacement_header[3] = {0};
+    uint8_t* original_records = NULL;
+    uint8_t* replacement_records = NULL;
+    BOOL compatible = FALSE;
+    LARGE_INTEGER position;
+    DWORD bytes_read = 0;
+    position.QuadPart = (LONGLONG)entry->offset;
+    if (!SetFilePointerEx(original, position, NULL, FILE_BEGIN) ||
+        !fp_original_ReadFile(original, original_header, sizeof(original_header), &bytes_read, NULL) ||
+        bytes_read != sizeof(original_header) ||
+        !fp_original_ReadFile(replacement, replacement_header, sizeof(replacement_header), &bytes_read, NULL) ||
+        bytes_read != sizeof(replacement_header)) {
+        goto done;
+    }
+
+    if (original_header[0] != replacement_header[0] ||
+        original_header[1] != replacement_header[1]) {
+        goto done;
+    }
+
+    uint64_t original_expected = 12ULL + (uint64_t)original_header[0] * 4ULL +
+                                 (uint64_t)original_header[1] + (uint64_t)original_header[2];
+    uint64_t replacement_expected = 12ULL + (uint64_t)replacement_header[0] * 4ULL +
+                                    (uint64_t)replacement_header[1] + (uint64_t)replacement_header[2];
+    if (original_expected != entry->original_size ||
+        replacement_expected != (uint64_t)(unsigned long)ext_size) {
+        goto done;
+    }
+
+    uint64_t record_region_u64 = (uint64_t)original_header[0] * 4ULL +
+                                 (uint64_t)original_header[1];
+    if (record_region_u64 == 0 || record_region_u64 > 0xFFFFFFFFULL) goto done;
+    DWORD record_region_size = (DWORD)record_region_u64;
+    original_records = (uint8_t*)malloc(record_region_size);
+    replacement_records = (uint8_t*)malloc(record_region_size);
+    if (!original_records || !replacement_records ||
+        !fp_original_ReadFile(original, original_records, record_region_size, &bytes_read, NULL) ||
+        bytes_read != record_region_size ||
+        !fp_original_ReadFile(replacement, replacement_records, record_region_size, &bytes_read, NULL) ||
+        bytes_read != record_region_size) {
+        goto done;
+    }
+
+    /* Compare every variable-record size prefix. Text offsets and lengths may
+       change, but the current-version record structure must remain exactly
+       shape-compatible with the installed archive. */
+    uint64_t cursor = 0;
+    for (uint32_t i = 0; i < original_header[0]; i++) {
+        if (cursor + 4ULL > record_region_u64) goto done;
+        uint32_t original_record_size = 0;
+        uint32_t replacement_record_size = 0;
+        memcpy(&original_record_size, original_records + cursor, sizeof(original_record_size));
+        memcpy(&replacement_record_size, replacement_records + cursor, sizeof(replacement_record_size));
+        if (original_record_size == 0 || original_record_size != replacement_record_size ||
+            (original_record_size & 3U) != 0 ||
+            cursor + 4ULL + (uint64_t)original_record_size > record_region_u64) {
+            goto done;
+        }
+        cursor += 4ULL + (uint64_t)original_record_size;
+    }
+    if (cursor != record_region_u64) goto done;
+
+    compatible = TRUE;
+
+done:
+    if (original_records) free(original_records);
+    if (replacement_records) free(replacement_records);
+    CloseHandle(original);
+    CloseHandle(replacement);
+    return compatible;
+}
+
+static BOOL database_override_is_compatible(
+    VfsEntry* entry,
+    const wchar_t* override_path_w,
+    long ext_size)
+{
+    if (!entry || !is_version_sensitive_database(entry->name)) return TRUE;
+    if (is_verified_v120_executable()) return TRUE;
+
+    LONG cached = InterlockedCompareExchange(&entry->database_compat, 2, 0);
+    if (cached == 1) return TRUE;
+    if (cached == -1) return FALSE;
+    if (cached == 2) {
+        /* Another game thread is validating this same entry. Wait briefly so
+           initialization never receives a mixture of original and override
+           reads for one database. */
+        for (int i = 0; i < 5000; i++) {
+            Sleep(1);
+            cached = InterlockedCompareExchange(&entry->database_compat, 0, 0);
+            if (cached != 2) return cached > 0;
+        }
+        log_msg("[VFS COMPAT] Timed out while checking database override [%s]", entry->name);
+        return FALSE;
+    }
+
+    BOOL compatible = database_override_matches_current_shape(entry, override_path_w, ext_size);
+    InterlockedExchange(&entry->database_compat, compatible ? 1 : -1);
+    if (compatible) {
+        log_msg("[VFS COMPAT] Allowing database override with matching current record shape [%s]: archive=%llu, override=%ld",
+                entry->name, (unsigned long long)entry->original_size, ext_size);
+        return TRUE;
+    }
+
+    log_msg("[VFS COMPAT] Skipping incompatible database override [%s]: archive=%llu, override=%ld",
+            entry->name, (unsigned long long)entry->original_size, ext_size);
+    return FALSE;
 }
 
 /* Search for override file in Mods directory structures */
@@ -2008,17 +2225,6 @@ static const FadSubFile* lookup_fad_subfile(uint64_t offset)
 /* ==================================================================
  * Hook Definitions: CreateFileW & CreateFileA for Archive Redirection
  * ================================================================== */
-typedef HANDLE (WINAPI *t_CreateFileW)(
-    LPCWSTR lpFileName,
-    DWORD dwDesiredAccess,
-    DWORD dwShareMode,
-    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-    DWORD dwCreationDisposition,
-    DWORD dwFlagsAndAttributes,
-    HANDLE hTemplateFile
-);
-static t_CreateFileW fp_original_CreateFileW = NULL;
-
 typedef HANDLE (WINAPI *t_CreateFileA)(
     LPCSTR lpFileName,
     DWORD dwDesiredAccess,
@@ -2104,15 +2310,6 @@ static HANDLE WINAPI hk_CreateFileA(
 /* ==================================================================
  * Hook Definitions: ReadFile for Virtual File System (VFS)
  * ================================================================== */
-typedef BOOL (WINAPI *t_ReadFile)(
-    HANDLE hFile,
-    LPVOID lpBuffer,
-    DWORD nNumberOfBytesToRead,
-    LPDWORD lpNumberOfBytesRead,
-    LPOVERLAPPED lpOverlapped
-);
-static t_ReadFile fp_original_ReadFile = NULL;
-
 #define MAX_CACHED_HANDLES 128
 typedef struct {
     HANDLE h;
@@ -2522,6 +2719,9 @@ static BOOL WINAPI hk_ReadFile(
                     wchar_t override_path_w[MAX_PATH];
                     long ext_size = 0;
                     if (find_override_file_w(v->name, override_path_w, MAX_PATH, &ext_size)) {
+                        if (!database_override_is_compatible(v, override_path_w, ext_size)) {
+                            continue;
+                        }
                         if (ext_size > (long)tocs[i].size) {
                             log_msg("[VFS TOC Patch] Expanding TOC size for [%s]: %llu -> %ld bytes",
                                     v->name, (unsigned long long)tocs[i].size, ext_size);
@@ -2623,7 +2823,13 @@ static BOOL WINAPI hk_ReadFile(
 
         wchar_t override_path_w[MAX_PATH];
         long ext_size = 0;
-        if (find_override_file_w(entry->name, override_path_w, MAX_PATH, &ext_size)) {
+        BOOL has_compatible_override = find_override_file_w(entry->name, override_path_w, MAX_PATH, &ext_size);
+        if (has_compatible_override &&
+            !database_override_is_compatible(entry, override_path_w, ext_size)) {
+            has_compatible_override = FALSE;
+        }
+
+        if (has_compatible_override) {
             log_msg("[VFS OVERRIDE] Target [%s] (0x%llX) -> %ls (requested=%u, ext_size=%ld)",
                     entry->name, (unsigned long long)offset, override_path_w, nNumberOfBytesToRead, ext_size);
             if (lpOverlapped) {
