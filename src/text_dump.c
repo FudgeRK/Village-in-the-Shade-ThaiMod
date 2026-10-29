@@ -2590,34 +2590,154 @@ static void patch_texture_database_in_ram(void* buffer, DWORD size)
     log_msg("[Texture DB Patch] Applied %d texture redirections in RAM (data/database/texture.dat)!", total_applied);
 }
 
+static BOOL font_text_ref_is_ttf_path(
+    const uint8_t* text_pool,
+    uint32_t text_size,
+    uint32_t offset,
+    uint32_t length)
+{
+    static const char prefix[] = "data/misc/";
+    static const char suffix[] = ".ttf";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const size_t suffix_len = sizeof(suffix) - 1;
+
+    if (!text_pool || length < prefix_len + suffix_len ||
+        (uint64_t)offset + (uint64_t)length > text_size) {
+        return FALSE;
+    }
+
+    const char* text = (const char*)text_pool + offset;
+    return _strnicmp(text, prefix, prefix_len) == 0 &&
+           _strnicmp(text + length - suffix_len, suffix, suffix_len) == 0;
+}
+
+static BOOL font_text_ref_is_kiwimaru(
+    const uint8_t* text_pool,
+    uint32_t text_size,
+    uint32_t offset,
+    uint32_t length)
+{
+    if (!font_text_ref_is_ttf_path(text_pool, text_size, offset, length)) {
+        return FALSE;
+    }
+
+    const char* text = (const char*)text_pool + offset;
+    static const char needle[] = "kiwimaru-";
+    const size_t needle_len = sizeof(needle) - 1;
+    if (length < needle_len) return FALSE;
+
+    for (uint32_t i = 0; i + needle_len <= length; i++) {
+        if (_strnicmp(text + i, needle, needle_len) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static void patch_font_database_in_ram(void* buffer, DWORD size)
 {
     if (!buffer || size < 64) return;
 
     uint8_t* p = (uint8_t*)buffer;
     uint32_t num_records = *(uint32_t*)(p + 0);
-    uint32_t record_size = *(uint32_t*)(p + 12);
+    uint32_t record_data_size = *(uint32_t*)(p + 4);
+    uint32_t text_size = *(uint32_t*)(p + 8);
+    uint64_t text_base_u64 = 12ULL + (uint64_t)num_records * 4ULL +
+                             (uint64_t)record_data_size;
 
-    if (num_records == 0 || num_records > 32 || record_size < 100 || record_size > 4096) {
-        log_msg("[Font DB Patch WARN] Unexpected font.dat header: num_records=%u, record_size=%u",
-                num_records, record_size);
+    if (num_records == 0 || num_records > 32 || text_base_u64 > size ||
+        text_base_u64 + text_size != size) {
+        log_msg("[Font DB Patch WARN] Unexpected font.dat layout: records=%u, record_data=%u, text=%u, file=%u",
+                num_records, record_data_size, text_size, size);
         return;
     }
 
-    /* 1. Configure Proportional spacing (flag1=1, flag2=5) across all records */
-    uint32_t stride = record_size + 4;
-    int patched_flags = 0;
+    const size_t text_base = (size_t)text_base_u64;
+    const uint8_t* text_pool = p + text_base;
+    size_t cursor = 12;
+    int patched_records = 0;
+    int patched_locales = 0;
+
     for (uint32_t r = 0; r < num_records; r++) {
-        size_t rec_start = 16 + (size_t)r * stride;
-        if (rec_start + 0x68 <= size) {
-            *(uint32_t*)(p + rec_start + 0x60) = 1;
-            *(uint32_t*)(p + rec_start + 0x64) = 5;
-            patched_flags++;
+        if (cursor + 4 > text_base) break;
+
+        uint32_t record_size = *(uint32_t*)(p + cursor);
+        if (record_size == 0 || (record_size & 3U) != 0 ||
+            cursor + 4ULL + record_size > text_base) {
+            log_msg("[Font DB Patch WARN] Invalid record %u size=%u", r, record_size);
+            break;
         }
+
+        uint32_t* words = (uint32_t*)(p + cursor + 4);
+        uint32_t word_count = record_size / 4;
+        uint32_t kiwi_path_index = UINT32_MAX;
+        uint32_t locale_path_indices[16];
+        uint32_t locale_count = 0;
+
+        /* Every language slot contains a path/length pair for its TTF.  The
+           number of slots changed from six in v1.20 to seven in v1.30, so
+           discover them from the current database instead of using offsets. */
+        for (uint32_t i = 1; i + 1 < word_count; i++) {
+            if (!font_text_ref_is_ttf_path(
+                    text_pool, text_size, words[i], words[i + 1])) {
+                continue;
+            }
+            if (locale_count < (uint32_t)(sizeof(locale_path_indices) /
+                                           sizeof(locale_path_indices[0]))) {
+                locale_path_indices[locale_count++] = i;
+            }
+            if (font_text_ref_is_kiwimaru(
+                    text_pool, text_size, words[i], words[i + 1])) {
+                kiwi_path_index = i;
+            }
+            i++;
+        }
+
+        if (kiwi_path_index == UINT32_MAX || kiwi_path_index + 3 >= word_count) {
+            log_msg("[Font DB Patch WARN] Record %u has no usable KiwiMaru locale", r);
+            cursor += 4 + record_size;
+            continue;
+        }
+
+        uint32_t kiwi_path_offset = words[kiwi_path_index];
+        uint32_t kiwi_path_length = words[kiwi_path_index + 1];
+        uint32_t kiwi_family_offset = words[kiwi_path_index + 2];
+        uint32_t kiwi_family_length = words[kiwi_path_index + 3];
+
+        for (uint32_t i = 0; i < locale_count; i++) {
+            uint32_t path_index = locale_path_indices[i];
+            if (path_index + 3 >= word_count) continue;
+
+            /* Route every locale through the PUA-capable KiwiMaru font.  Both
+               the file path and family name must match or the engine can load
+               the bytes but still fail to select the face. */
+            words[path_index] = kiwi_path_offset;
+            words[path_index + 1] = kiwi_path_length;
+            words[path_index + 2] = kiwi_family_offset;
+            words[path_index + 3] = kiwi_family_length;
+
+            /* These proportional-layout flags are 18/19 words after the path
+               in both known database layouts.  Patch every locale, not only
+               the Japanese slot as the old fixed +0x60/+0x64 code did. */
+            if (path_index + 19 < word_count) {
+                words[path_index + 18] = 1;
+                words[path_index + 19] = 5;
+            }
+            patched_locales++;
+        }
+
+        if (locale_count > 0) patched_records++;
+        cursor += 4 + record_size;
     }
 
-    log_msg("[Font DB Patch] Success: Configured Proportional flags (%d records) in RAM (KiwiMaru retained)!",
-            patched_flags);
+    if (cursor != text_base) {
+        log_msg("[Font DB Patch WARN] Record region ended at %llu, expected %llu",
+                (unsigned long long)cursor, (unsigned long long)text_base);
+        return;
+    }
+
+    log_msg("[Font DB Patch] Routed %d locale slots across %d records to PUA-capable KiwiMaru.",
+            patched_locales, patched_records);
 }
 
 static BOOL WINAPI hk_GetOverlappedResult(
